@@ -1,5 +1,7 @@
 package booking
 
+import "sync"
+
 // MemoryStore is an in-memory implementation of the BookingStore interface.
 // It stores all bookings in a map where the key is the SeatID and the value
 // is the complete Booking record.
@@ -11,6 +13,7 @@ package booking
 //   - Memory usage grows linearly with the number of bookings
 type MemoryStore struct {
 	bookings map[string]Booking
+	sync.RWMutex
 }
 
 // NewMemoryStore creates and initializes a new MemoryStore instance.
@@ -39,6 +42,9 @@ func NewMemoryStore() *MemoryStore {
 //   - error: nil on successful booking, ErrSeatAlreadyTaken if the seat
 //     is already reserved.
 func (store *MemoryStore) Book(booking Booking) error {
+	store.Lock()
+	defer store.Unlock()
+
 	// check if the seat is already taken
 	if _, exists := store.bookings[booking.SeatID]; exists == true {
 		return ErrSeatAlreadyTaken
@@ -67,6 +73,9 @@ func (store *MemoryStore) Book(booking Booking) error {
 //   - []Booking: a new slice containing all bookings for the specified movie.
 //     Returns an empty slice if no matching bookings are found.
 func (store *MemoryStore) ListBookings(movieID string) []Booking {
+	store.RLock()
+	defer store.RUnlock()
+
 	var result []Booking
 	for _, booking := range store.bookings {
 		if booking.MovieID == movieID {
