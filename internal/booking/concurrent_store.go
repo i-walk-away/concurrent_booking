@@ -1,13 +1,16 @@
 package booking
 
-// MemoryStore stores bookings in memory.
-type MemoryStore struct {
+import "sync"
+
+// ConcurrentStore stores bookings in memory and is safe for concurrent use.
+type ConcurrentStore struct {
 	bookings map[string]Booking
+	sync.RWMutex
 }
 
-// NewMemoryStore returns an empty in-memory booking store.
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
+// NewConcurrentStore returns an empty concurrent booking store.
+func NewConcurrentStore() *ConcurrentStore {
+	return &ConcurrentStore{
 		bookings: map[string]Booking{},
 	}
 }
@@ -15,7 +18,10 @@ func NewMemoryStore() *MemoryStore {
 // Book adds a booking to the store.
 //
 // It returns ErrSeatAlreadyBooked if the seat is already booked.
-func (s *MemoryStore) Book(b Booking) error {
+func (s *ConcurrentStore) Book(b Booking) error {
+	s.Lock()
+	defer s.Unlock()
+
 	if _, exists := s.bookings[b.SeatID]; exists {
 		return ErrSeatAlreadyBooked
 	}
@@ -26,7 +32,10 @@ func (s *MemoryStore) Book(b Booking) error {
 }
 
 // ListBookings returns all bookings for the given movie.
-func (s *MemoryStore) ListBookings(movieID string) []Booking {
+func (s *ConcurrentStore) ListBookings(movieID string) []Booking {
+	s.RLock()
+	defer s.RUnlock()
+
 	var result []Booking
 
 	for _, b := range s.bookings {
