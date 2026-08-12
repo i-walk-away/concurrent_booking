@@ -11,7 +11,9 @@ import (
 //
 // It terminates the process if the Redis server is unreachable.
 func NewClient(addr string) *goredis.Client {
-	rdb := goredis.NewClient(&goredis.Options{Addr: addr})
+	rdb := goredis.NewClient(&goredis.Options{
+		Addr: addr,
+	})
 
 	if err := rdb.Ping(context.Background()).Err(); err != nil {
 		log.Fatalf("redis ping: %v", err)

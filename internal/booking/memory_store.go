@@ -1,39 +1,108 @@
 package booking
 
+import (
+	"context"
+	"errors"
+	"sync"
+	"time"
+)
+
+var errSessionNotFound = errors.New("booking session not found")
+
 // MemoryStore stores bookings in memory.
+//
+// MemoryStore is safe for concurrent use.
 type MemoryStore struct {
+	mu       sync.RWMutex
 	bookings map[string]Booking
 }
 
 // NewMemoryStore returns an empty in-memory booking store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		bookings: map[string]Booking{},
+		bookings: make(map[string]Booking),
 	}
 }
 
 // Book adds a booking to the store.
 //
 // It returns ErrSeatAlreadyBooked if the seat is already booked.
-func (s *MemoryStore) Book(b Booking) error {
-	if _, exists := s.bookings[b.SeatID]; exists {
-		return ErrSeatAlreadyBooked
+func (s *MemoryStore) Book(b Booking) (Booking, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, booking := range s.bookings {
+		if booking.MovieID == b.MovieID && booking.SeatID == b.SeatID {
+			return Booking{}, ErrSeatAlreadyBooked
+		}
 	}
 
-	s.bookings[b.SeatID] = b
+	s.bookings[b.ID] = b
 
-	return nil
+	return b, nil
 }
 
 // ListBookings returns all bookings for the given movie.
 func (s *MemoryStore) ListBookings(movieID string) []Booking {
-	var result []Booking
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	for _, b := range s.bookings {
-		if b.MovieID == movieID {
-			result = append(result, b)
+	bookings := make([]Booking, 0)
+
+	for _, booking := range s.bookings {
+		if booking.MovieID == movieID {
+			bookings = append(bookings, booking)
 		}
 	}
 
-	return result
+	return bookings
+}
+
+// Confirm confirms a booking session for the given user.
+func (s *MemoryStore) Confirm(
+	_ context.Context,
+	sessionID string,
+	userID string,
+) (Booking, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	booking, ok := s.bookings[sessionID]
+	if !ok {
+		return Booking{}, errSessionNotFound
+	}
+
+	if booking.UserID != userID {
+		return Booking{}, errSessionNotFound
+	}
+
+	booking.Status = statusConfirmed
+	booking.ExpiresAt = time.Time{}
+
+	s.bookings[sessionID] = booking
+
+	return booking, nil
+}
+
+// Release releases a booking session for the given user.
+func (s *MemoryStore) Release(
+	_ context.Context,
+	sessionID string,
+	userID string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	booking, ok := s.bookings[sessionID]
+	if !ok {
+		return errSessionNotFound
+	}
+
+	if booking.UserID != userID {
+		return errSessionNotFound
+	}
+
+	delete(s.bookings, sessionID)
+
+	return nil
 }

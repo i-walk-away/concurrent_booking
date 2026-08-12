@@ -1,10 +1,11 @@
 package booking
 
 import (
-	"concurrent_booking/internal/adapters/redis"
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"concurrent_booking/internal/adapters/redis"
 
 	"github.com/google/uuid"
 )
@@ -32,7 +33,7 @@ func TestConcurrentBooking_ExactlyOneWins(t *testing.T) {
 			_, err := svc.Book(Booking{
 				MovieID: "screen-1",
 				SeatID:  "A1",
-				UserID:  uuid.New().String(),
+				UserID:  uuid.NewString(),
 			})
 
 			if err == nil {

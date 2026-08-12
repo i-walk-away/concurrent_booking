@@ -2,7 +2,7 @@ package booking
 
 import (
 	"encoding/json"
-	"log"
+	"errors"
 	"net/http"
 	"time"
 
@@ -32,35 +32,51 @@ func (h *handler) HoldSeat(w http.ResponseWriter, r *http.Request) {
 
 	var req holdSeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Println(err)
+		utils.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid request body",
+		})
 		return
 	}
 
-	data := Booking{
+	if req.UserID == "" {
+		utils.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "user_id is required",
+		})
+		return
+	}
+
+	session, err := h.svc.Book(Booking{
 		UserID:  req.UserID,
 		SeatID:  seatID,
 		MovieID: movieID,
-	}
-
-	session, err := h.svc.Book(data)
+	})
 	if err != nil {
-		log.Println(err)
+		if errors.Is(err, ErrSeatAlreadyBooked) {
+			utils.WriteJSON(w, http.StatusConflict, map[string]string{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		utils.WriteJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "failed to hold seat",
+		})
 		return
 	}
 
-	type holdResponse struct {
-		SessionID string `json:"session_id"`
-		MovieID   string `json:"movieID"`
-		SeatID    string `json:"seat_id"`
-		ExpiresAt string `json:"expires_at"`
-	}
-
 	utils.WriteJSON(w, http.StatusCreated, holdResponse{
-		SeatID:    seatID,
+		SeatID:    session.SeatID,
 		MovieID:   session.MovieID,
 		SessionID: session.ID,
 		ExpiresAt: session.ExpiresAt.Format(time.RFC3339),
 	})
+}
+
+type holdResponse struct {
+	SessionID string `json:"session_id"`
+	MovieID   string `json:"movie_id"`
+	SeatID    string `json:"seat_id"`
+	ExpiresAt string `json:"expires_at"`
 }
 
 // ListSeats returns the current booking status of all seats for a movie.
@@ -95,15 +111,24 @@ func (h *handler) ConfirmSession(w http.ResponseWriter, r *http.Request) {
 
 	var req holdSeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid request body",
+		})
 		return
 	}
 
 	if req.UserID == "" {
+		utils.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "user_id is required",
+		})
 		return
 	}
 
 	session, err := h.svc.ConfirmSeat(r.Context(), sessionID, req.UserID)
 	if err != nil {
+		utils.WriteJSON(w, http.StatusNotFound, map[string]string{
+			"error": "session not found",
+		})
 		return
 	}
 
@@ -111,7 +136,7 @@ func (h *handler) ConfirmSession(w http.ResponseWriter, r *http.Request) {
 		SessionID: session.ID,
 		MovieID:   session.MovieID,
 		SeatID:    session.SeatID,
-		UserID:    req.UserID,
+		UserID:    session.UserID,
 		Status:    session.Status,
 	})
 }
@@ -131,17 +156,23 @@ func (h *handler) ReleaseSession(w http.ResponseWriter, r *http.Request) {
 
 	var req holdSeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Println(err)
+		utils.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "invalid request body",
+		})
 		return
 	}
 
 	if req.UserID == "" {
+		utils.WriteJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "user_id is required",
+		})
 		return
 	}
 
-	err := h.svc.ReleaseSeat(r.Context(), sessionID, req.UserID)
-	if err != nil {
-		log.Println(err)
+	if err := h.svc.ReleaseSeat(r.Context(), sessionID, req.UserID); err != nil {
+		utils.WriteJSON(w, http.StatusNotFound, map[string]string{
+			"error": "session not found",
+		})
 		return
 	}
 

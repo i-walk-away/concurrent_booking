@@ -3,25 +3,27 @@ package booking
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-const defaultHoldTTL = 2 * time.Minute
+const (
+	defaultHoldTTL = 2 * time.Minute
+
+	statusHeld      = "held"
+	statusConfirmed = "confirmed"
+)
 
 // RedisStore implements session-based seat booking backed by Redis.
 //
-// Seat keys store booking sessions and expire automatically while a seat is
-// held. Confirmed bookings have no expiration.
+// Key design:
 //
-// The store uses the following Redis keys:
-//
-//	seat:{movieID}:{seatID} → booking session
-//	session:{sessionID}     → seat key for reverse lookup
+//	seat:{movieID}:{seatID}   → session JSON (TTL = held, no TTL = confirmed)
+//	session:{sessionID}       → seat key     (reverse lookup)
 type RedisStore struct {
 	rdb *redis.Client
 }
@@ -31,128 +33,158 @@ func NewRedisStore(rdb *redis.Client) *RedisStore {
 	return &RedisStore{rdb: rdb}
 }
 
-// sessionKey returns the Redis key used for reverse lookup by session ID.
+// sessionKey builds the reverse-lookup key for a session.
 func sessionKey(id string) string {
 	return fmt.Sprintf("session:%s", id)
 }
 
+// seatKey builds the Redis key for a movie seat.
+func seatKey(movieID, seatID string) string {
+	return fmt.Sprintf("seat:%s:%s", movieID, seatID)
+}
+
 // Book creates a temporary seat reservation.
 //
-// The reservation expires after the default hold duration. It returns
-// ErrSeatAlreadyBooked if the seat is already reserved.
+// It returns ErrSeatAlreadyBooked if the seat is already reserved.
 func (s *RedisStore) Book(b Booking) (Booking, error) {
-	session, err := s.hold(b)
+	now := time.Now()
+
+	b.ID = uuid.NewString()
+	b.Status = statusHeld
+	b.ExpiresAt = now.Add(defaultHoldTTL)
+
+	key := seatKey(b.MovieID, b.SeatID)
+
+	data, err := json.Marshal(b)
 	if err != nil {
-		return Booking{}, err
+		return Booking{}, fmt.Errorf("marshal booking: %w", err)
 	}
 
-	log.Printf("Session booked %v", session)
+	ctx := context.Background()
 
-	return session, nil
+	ok, err := s.rdb.SetNX(ctx, key, data, defaultHoldTTL).Result()
+	if err != nil {
+		return Booking{}, fmt.Errorf("hold seat: %w", err)
+	}
+
+	if !ok {
+		return Booking{}, ErrSeatAlreadyBooked
+	}
+
+	if err := s.rdb.Set(
+		ctx,
+		sessionKey(b.ID),
+		key,
+		defaultHoldTTL,
+	).Err(); err != nil {
+		// Do not leave a seat hold behind if its reverse lookup could not
+		// be created.
+		_ = s.rdb.Del(ctx, key).Err()
+
+		return Booking{}, fmt.Errorf("create session: %w", err)
+	}
+
+	return b, nil
 }
 
 // ListBookings returns all booking sessions for the given movie.
 func (s *RedisStore) ListBookings(movieID string) []Booking {
+	ctx := context.Background()
 	pattern := fmt.Sprintf("seat:%s:*", movieID)
-	var sessions []Booking
 
-	ctx := context.Background()
+	var bookings []Booking
+	var cursor uint64
 
-	iter := s.rdb.Scan(ctx, 0, pattern, 0).Iterator()
-	for iter.Next(ctx) {
-		val, err := s.rdb.Get(ctx, iter.Val()).Result()
+	for {
+		keys, nextCursor, err := s.rdb.Scan(
+			ctx,
+			cursor,
+			pattern,
+			0,
+		).Result()
 		if err != nil {
-			continue
+			return bookings
 		}
 
-		session, err := parseSession(val)
-		if err != nil {
-			continue
+		for _, key := range keys {
+			value, err := s.rdb.Get(ctx, key).Result()
+			if err != nil {
+				if errors.Is(err, redis.Nil) {
+					continue
+				}
+
+				continue
+			}
+
+			booking, err := parseSession(value)
+			if err != nil {
+				continue
+			}
+
+			bookings = append(bookings, booking)
 		}
 
-		sessions = append(sessions, session)
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
 	}
 
-	return sessions
+	return bookings
 }
 
-func (s *RedisStore) hold(b Booking) (Booking, error) {
-	id := uuid.New().String()
-	now := time.Now()
-	ctx := context.Background()
-	key := fmt.Sprintf("seat:%s:%s", b.MovieID, b.SeatID)
-
-	b.ID = id
-
-	val, _ := json.Marshal(b)
-
-	res := s.rdb.SetArgs(ctx, key, val, redis.SetArgs{
-		Mode: "NX",
-		TTL:  defaultHoldTTL,
-	})
-
-	if res.Val() != "OK" {
-		return Booking{}, ErrSeatAlreadyBooked
-	}
-
-	s.rdb.Set(ctx, sessionKey(id), key, defaultHoldTTL)
-
-	return Booking{
-		ID:        id,
-		MovieID:   b.MovieID,
-		SeatID:    b.SeatID,
-		UserID:    b.UserID,
-		Status:    "held",
-		ExpiresAt: now.Add(defaultHoldTTL),
-	}, nil
-}
-
-func parseSession(val string) (Booking, error) {
-	var data Booking
-	if err := json.Unmarshal([]byte(val), &data); err != nil {
-		return Booking{}, err
-	}
-
-	return Booking{
-		ID:      data.ID,
-		MovieID: data.MovieID,
-		SeatID:  data.SeatID,
-		UserID:  data.UserID,
-		Status:  data.Status,
-	}, nil
-}
-
-// Confirm confirms a held booking session for the given user.
+// Confirm converts a held session into a permanent booking.
 //
-// A confirmed booking is made permanent by removing the expiration time from
-// both the seat key and the session key.
+// It removes the TTL from the seat and session keys so they do not expire.
 func (s *RedisStore) Confirm(
 	ctx context.Context,
 	sessionID string,
 	userID string,
 ) (Booking, error) {
-	session, sk, err := s.getSession(ctx, sessionID, userID)
+	session, key, err := s.getSession(ctx, sessionID, userID)
 	if err != nil {
 		return Booking{}, err
 	}
 
-	s.rdb.Persist(ctx, sk)
-	s.rdb.Persist(ctx, sessionKey(sessionID))
+	session.Status = statusConfirmed
+	session.ExpiresAt = time.Time{}
 
-	session.Status = "confirmed"
-
-	data := Booking{
-		ID:      session.ID,
-		MovieID: session.MovieID,
-		SeatID:  session.SeatID,
-		UserID:  session.UserID,
-		Status:  "confirmed",
+	data, err := json.Marshal(session)
+	if err != nil {
+		return Booking{}, fmt.Errorf("marshal confirmed booking: %w", err)
 	}
 
-	val, _ := json.Marshal(data)
-	s.rdb.Set(ctx, sk, val, 0)
+	if err := s.rdb.Set(ctx, key, data, 0).Err(); err != nil {
+		return Booking{}, fmt.Errorf("confirm booking: %w", err)
+	}
+
+	if err := s.rdb.Persist(ctx, sessionKey(sessionID)).Err(); err != nil {
+		return Booking{}, fmt.Errorf("persist session: %w", err)
+	}
 
 	return session, nil
+}
+
+// Release releases a held booking session for the given user.
+func (s *RedisStore) Release(
+	ctx context.Context,
+	sessionID string,
+	userID string,
+) error {
+	_, key, err := s.getSession(ctx, sessionID, userID)
+	if err != nil {
+		return err
+	}
+
+	if err := s.rdb.Del(
+		ctx,
+		key,
+		sessionKey(sessionID),
+	).Err(); err != nil {
+		return fmt.Errorf("release session: %w", err)
+	}
+
+	return nil
 }
 
 func (s *RedisStore) getSession(
@@ -160,32 +192,34 @@ func (s *RedisStore) getSession(
 	sessionID string,
 	userID string,
 ) (Booking, string, error) {
-	sk, err := s.rdb.Get(ctx, sessionKey(sessionID)).Result()
+	key, err := s.rdb.Get(ctx, sessionKey(sessionID)).Result()
 	if err != nil {
-		return Booking{}, "", err
+		return Booking{}, "", fmt.Errorf("get session: %w", err)
 	}
 
-	val, err := s.rdb.Get(ctx, sk).Result()
+	value, err := s.rdb.Get(ctx, key).Result()
 	if err != nil {
-		return Booking{}, "", err
+		return Booking{}, "", fmt.Errorf("get booking: %w", err)
 	}
 
-	session, err := parseSession(val)
+	session, err := parseSession(value)
 	if err != nil {
-		return Booking{}, "", err
+		return Booking{}, "", fmt.Errorf("parse booking: %w", err)
 	}
 
-	return session, sk, nil
+	if session.UserID != userID {
+		return Booking{}, "", errors.New("session does not belong to user")
+	}
+
+	return session, key, nil
 }
 
-// Release releases a held booking session for the given user.
-func (s *RedisStore) Release(ctx context.Context, sessionID string, userID string) error {
-	_, sk, err := s.getSession(ctx, sessionID, userID)
-	if err != nil {
-		return err
+func parseSession(value string) (Booking, error) {
+	var booking Booking
+
+	if err := json.Unmarshal([]byte(value), &booking); err != nil {
+		return Booking{}, err
 	}
 
-	s.rdb.Del(ctx, sk, sessionKey(sessionID))
-
-	return nil
+	return booking, nil
 }
