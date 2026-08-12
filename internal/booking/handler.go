@@ -1,7 +1,6 @@
 package booking
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"net/http"
