@@ -32,8 +32,8 @@ func main() {
 }
 
 var movies = []movieResponse{
-	{ID: "inception", Title: "Inception", Rows: 5, SeatsPerRow: 8},
-	{ID: "dune", Title: "Dune: Part Two", Rows: 4, SeatsPerRow: 6},
+	{ID: "oppenheimer", Title: "Oppenheimer", Rows: 5, SeatsPerRow: 8},
+	{ID: "sandandwater", Title: "Sand and Water", Rows: 4, SeatsPerRow: 6},
 }
 
 func listMovies(w http.ResponseWriter, r *http.Request) {
