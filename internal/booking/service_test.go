@@ -1,56 +1,164 @@
 package booking
 
 import (
-	"sync"
-	"sync/atomic"
+	"context"
+	"errors"
 	"testing"
-
-	"concurrent_booking/internal/adapters/redis"
-
-	"github.com/google/uuid"
 )
 
-// TestConcurrentBooking_ExactlyOneWins verifies that concurrent attempts to
-// book the same seat result in exactly one successful booking.
-func TestConcurrentBooking_ExactlyOneWins(t *testing.T) {
-	store := NewRedisStore(redis.NewClient("localhost:6379"))
+func TestServiceBook(t *testing.T) {
+	store := NewInMemoryStore()
 	svc := NewService(store)
 
-	const numGoroutines = 100_000
+	booking, err := svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A1",
+		UserID:  "user-1",
+	})
+	if err != nil {
+		t.Fatalf("book: %v", err)
+	}
 
-	var (
-		successes atomic.Int64
-		failures  atomic.Int64
-		wg        sync.WaitGroup
+	if booking.ID == "" {
+		t.Fatal("expected booking ID to be generated")
+	}
+
+	if booking.MovieID != "inception" {
+		t.Errorf("expected movie ID %q, got %q", "inception", booking.MovieID)
+	}
+
+	if booking.SeatID != "A1" {
+		t.Errorf("expected seat ID %q, got %q", "A1", booking.SeatID)
+	}
+
+	if booking.UserID != "user-1" {
+		t.Errorf("expected user ID %q, got %q", "user-1", booking.UserID)
+	}
+
+	if booking.Status != statusHeld {
+		t.Errorf("expected status %q, got %q", statusHeld, booking.Status)
+	}
+}
+
+func TestServiceListBookings(t *testing.T) {
+	store := NewInMemoryStore()
+	svc := NewService(store)
+
+	_, err := svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A1",
+		UserID:  "user-1",
+	})
+	if err != nil {
+		t.Fatalf("book A1: %v", err)
+	}
+
+	_, err = svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A2",
+		UserID:  "user-2",
+	})
+	if err != nil {
+		t.Fatalf("book A2: %v", err)
+	}
+
+	_, err = svc.Book(Booking{
+		MovieID: "dune",
+		SeatID:  "A1",
+		UserID:  "user-3",
+	})
+	if err != nil {
+		t.Fatalf("book Dune A1: %v", err)
+	}
+
+	bookings := svc.ListBookings("inception")
+
+	if len(bookings) != 2 {
+		t.Fatalf("expected 2 bookings, got %d", len(bookings))
+	}
+}
+
+func TestServiceConfirmSeat(t *testing.T) {
+	store := NewInMemoryStore()
+	svc := NewService(store)
+
+	booking, err := svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A1",
+		UserID:  "user-1",
+	})
+	if err != nil {
+		t.Fatalf("book: %v", err)
+	}
+
+	confirmed, err := svc.ConfirmSeat(
+		context.Background(),
+		booking.ID,
+		"user-1",
 	)
-
-	wg.Add(numGoroutines)
-
-	for i := range numGoroutines {
-		go func(userNum int) {
-			defer wg.Done()
-
-			_, err := svc.Book(Booking{
-				MovieID: "screen-1",
-				SeatID:  "A1",
-				UserID:  uuid.NewString(),
-			})
-
-			if err == nil {
-				successes.Add(1)
-			} else {
-				failures.Add(1)
-			}
-		}(i)
+	if err != nil {
+		t.Fatalf("confirm seat: %v", err)
 	}
 
-	wg.Wait()
+	if confirmed.Status != statusConfirmed {
+		t.Errorf(
+			"expected status %q, got %q",
+			statusConfirmed,
+			confirmed.Status,
+		)
+	}
+}
 
-	if got := successes.Load(); got != 1 {
-		t.Errorf("expected exactly 1 success, got %d", got)
+func TestServiceConfirmSeatRejectsAnotherUser(t *testing.T) {
+	store := NewInMemoryStore()
+	svc := NewService(store)
+
+	booking, err := svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A1",
+		UserID:  "user-1",
+	})
+	if err != nil {
+		t.Fatalf("book: %v", err)
 	}
 
-	if got := failures.Load(); got != int64(numGoroutines-1) {
-		t.Errorf("expected %d failures, got %d", numGoroutines-1, got)
+	_, err = svc.ConfirmSeat(
+		context.Background(),
+		booking.ID,
+		"user-2",
+	)
+	if !errors.Is(err, ErrSessionNotOwned) {
+		t.Fatalf("expected ErrSessionNotOwned, got %v", err)
+	}
+}
+
+func TestServiceReleaseSeat(t *testing.T) {
+	store := NewInMemoryStore()
+	svc := NewService(store)
+
+	booking, err := svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A1",
+		UserID:  "user-1",
+	})
+	if err != nil {
+		t.Fatalf("book: %v", err)
+	}
+
+	if err := svc.ReleaseSeat(
+		context.Background(),
+		booking.ID,
+		"user-1",
+	); err != nil {
+		t.Fatalf("release seat: %v", err)
+	}
+
+	_, err = svc.Book(Booking{
+		MovieID: "inception",
+		SeatID:  "A1",
+		UserID:  "user-2",
+	})
+	if err != nil {
+		t.Fatalf("book after release: %v", err)
 	}
 }

@@ -2,54 +2,77 @@ package booking
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
-var errSessionNotFound = errors.New("booking session not found")
-
-// MemoryStore stores bookings in memory.
+// InMemoryStore stores bookings in memory.
 //
-// MemoryStore is safe for concurrent use.
-type MemoryStore struct {
+// It is intended primarily for unit tests and local development where a
+// persistent Redis instance is not required.
+//
+// InMemoryStore is safe for concurrent use and follows the same booking
+// semantics as RedisStore, including temporary holds and session ownership.
+type InMemoryStore struct {
 	mu       sync.RWMutex
 	bookings map[string]Booking
 }
 
-// NewMemoryStore returns an empty in-memory booking store.
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
+// NewInMemoryStore returns an empty in-memory booking store.
+func NewInMemoryStore() *InMemoryStore {
+	return &InMemoryStore{
 		bookings: make(map[string]Booking),
 	}
 }
 
-// Book adds a booking to the store.
+// Book creates a temporary booking for a seat.
 //
-// It returns ErrSeatAlreadyBooked if the seat is already booked.
-func (s *MemoryStore) Book(b Booking) (Booking, error) {
+// The booking expires after defaultHoldTTL. Expired holds are treated as
+// available and may be replaced by a new booking.
+func (s *InMemoryStore) Book(b Booking) (Booking, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, booking := range s.bookings {
+	now := time.Now()
+
+	for sessionID, booking := range s.bookings {
+		if s.isExpired(booking, now) {
+			delete(s.bookings, sessionID)
+			continue
+		}
+
 		if booking.MovieID == b.MovieID && booking.SeatID == b.SeatID {
 			return Booking{}, ErrSeatAlreadyBooked
 		}
 	}
+
+	b.ID = uuid.NewString()
+	b.Status = statusHeld
+	b.ExpiresAt = now.Add(defaultHoldTTL)
 
 	s.bookings[b.ID] = b
 
 	return b, nil
 }
 
-// ListBookings returns all bookings for the given movie.
-func (s *MemoryStore) ListBookings(movieID string) []Booking {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// ListBookings returns all active bookings for the given movie.
+//
+// Expired bookings are not returned.
+func (s *InMemoryStore) ListBookings(movieID string) []Booking {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
+	now := time.Now()
 	bookings := make([]Booking, 0)
 
-	for _, booking := range s.bookings {
+	for sessionID, booking := range s.bookings {
+		if s.isExpired(booking, now) {
+			delete(s.bookings, sessionID)
+			continue
+		}
+
 		if booking.MovieID == movieID {
 			bookings = append(bookings, booking)
 		}
@@ -58,8 +81,8 @@ func (s *MemoryStore) ListBookings(movieID string) []Booking {
 	return bookings
 }
 
-// Confirm confirms a booking session for the given user.
-func (s *MemoryStore) Confirm(
+// Confirm converts a temporary booking into a permanent booking.
+func (s *InMemoryStore) Confirm(
 	_ context.Context,
 	sessionID string,
 	userID string,
@@ -69,11 +92,16 @@ func (s *MemoryStore) Confirm(
 
 	booking, ok := s.bookings[sessionID]
 	if !ok {
-		return Booking{}, errSessionNotFound
+		return Booking{}, ErrSessionNotFound
 	}
 
 	if booking.UserID != userID {
-		return Booking{}, errSessionNotFound
+		return Booking{}, ErrSessionNotOwned
+	}
+
+	if s.isExpired(booking, time.Now()) {
+		delete(s.bookings, sessionID)
+		return Booking{}, ErrSessionNotFound
 	}
 
 	booking.Status = statusConfirmed
@@ -84,8 +112,8 @@ func (s *MemoryStore) Confirm(
 	return booking, nil
 }
 
-// Release releases a booking session for the given user.
-func (s *MemoryStore) Release(
+// Release removes a temporary booking.
+func (s *InMemoryStore) Release(
 	_ context.Context,
 	sessionID string,
 	userID string,
@@ -95,14 +123,25 @@ func (s *MemoryStore) Release(
 
 	booking, ok := s.bookings[sessionID]
 	if !ok {
-		return errSessionNotFound
+		return ErrSessionNotFound
 	}
 
 	if booking.UserID != userID {
-		return errSessionNotFound
+		return ErrSessionNotOwned
+	}
+
+	if s.isExpired(booking, time.Now()) {
+		delete(s.bookings, sessionID)
+		return ErrSessionNotFound
 	}
 
 	delete(s.bookings, sessionID)
 
 	return nil
+}
+
+func (s *InMemoryStore) isExpired(booking Booking, now time.Time) bool {
+	return booking.Status == statusHeld &&
+		!booking.ExpiresAt.IsZero() &&
+		!now.Before(booking.ExpiresAt)
 }

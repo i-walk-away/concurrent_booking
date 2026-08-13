@@ -11,18 +11,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	defaultHoldTTL = 2 * time.Minute
-
-	statusHeld      = "held"
-	statusConfirmed = "confirmed"
-)
+const defaultHoldTTL = 2 * time.Minute
 
 // RedisStore implements session-based seat booking backed by Redis.
 //
 // Key design:
 //
-//	seat:{movieID}:{seatID}   → session JSON (TTL = held, no TTL = confirmed)
+//	seat:{movieID}:{seatID}   → booking JSON (TTL = held, no TTL = confirmed)
 //	session:{sessionID}       → seat key     (reverse lookup)
 type RedisStore struct {
 	rdb *redis.Client
@@ -45,7 +40,8 @@ func seatKey(movieID, seatID string) string {
 
 // Book creates a temporary seat reservation.
 //
-// It returns ErrSeatAlreadyBooked if the seat is already reserved.
+// Redis SET NX provides the atomic check-and-set operation required to ensure
+// that concurrent attempts to book the same seat result in at most one winner.
 func (s *RedisStore) Book(b Booking) (Booking, error) {
 	now := time.Now()
 
@@ -87,47 +83,33 @@ func (s *RedisStore) Book(b Booking) (Booking, error) {
 	return b, nil
 }
 
-// ListBookings returns all booking sessions for the given movie.
+// ListBookings returns all active bookings for the given movie.
+//
+// Redis SCAN is used instead of KEYS so that listing bookings does not block
+// Redis while scanning a large keyspace.
 func (s *RedisStore) ListBookings(movieID string) []Booking {
 	ctx := context.Background()
 	pattern := fmt.Sprintf("seat:%s:*", movieID)
 
-	var bookings []Booking
-	var cursor uint64
+	bookings := make([]Booking, 0)
 
-	for {
-		keys, nextCursor, err := s.rdb.Scan(
-			ctx,
-			cursor,
-			pattern,
-			0,
-		).Result()
+	iter := s.rdb.Scan(ctx, 0, pattern, 0).Iterator()
+	for iter.Next(ctx) {
+		value, err := s.rdb.Get(ctx, iter.Val()).Result()
 		if err != nil {
-			return bookings
-		}
-
-		for _, key := range keys {
-			value, err := s.rdb.Get(ctx, key).Result()
-			if err != nil {
-				if errors.Is(err, redis.Nil) {
-					continue
-				}
-
+			if errors.Is(err, redis.Nil) {
 				continue
 			}
 
-			booking, err := parseSession(value)
-			if err != nil {
-				continue
-			}
-
-			bookings = append(bookings, booking)
+			continue
 		}
 
-		cursor = nextCursor
-		if cursor == 0 {
-			break
+		booking, err := parseBooking(value)
+		if err != nil {
+			continue
 		}
+
+		bookings = append(bookings, booking)
 	}
 
 	return bookings
@@ -135,7 +117,7 @@ func (s *RedisStore) ListBookings(movieID string) []Booking {
 
 // Confirm converts a held session into a permanent booking.
 //
-// It removes the TTL from the seat and session keys so they do not expire.
+// Removing the TTL makes both the seat and session persistent.
 func (s *RedisStore) Confirm(
 	ctx context.Context,
 	sessionID string,
@@ -165,7 +147,7 @@ func (s *RedisStore) Confirm(
 	return session, nil
 }
 
-// Release releases a held booking session for the given user.
+// Release removes a booking session.
 func (s *RedisStore) Release(
 	ctx context.Context,
 	sessionID string,
@@ -194,27 +176,35 @@ func (s *RedisStore) getSession(
 ) (Booking, string, error) {
 	key, err := s.rdb.Get(ctx, sessionKey(sessionID)).Result()
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return Booking{}, "", ErrSessionNotFound
+		}
+
 		return Booking{}, "", fmt.Errorf("get session: %w", err)
 	}
 
 	value, err := s.rdb.Get(ctx, key).Result()
 	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return Booking{}, "", ErrSessionNotFound
+		}
+
 		return Booking{}, "", fmt.Errorf("get booking: %w", err)
 	}
 
-	session, err := parseSession(value)
+	session, err := parseBooking(value)
 	if err != nil {
 		return Booking{}, "", fmt.Errorf("parse booking: %w", err)
 	}
 
 	if session.UserID != userID {
-		return Booking{}, "", errors.New("session does not belong to user")
+		return Booking{}, "", ErrSessionNotOwned
 	}
 
 	return session, key, nil
 }
 
-func parseSession(value string) (Booking, error) {
+func parseBooking(value string) (Booking, error) {
 	var booking Booking
 
 	if err := json.Unmarshal([]byte(value), &booking); err != nil {
